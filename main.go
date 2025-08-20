@@ -7,7 +7,9 @@ import (
     "log"
     "net/http"
     "os"
+    "os/signal"
     "strings"
+    "syscall"
 
     "github.com/kwacky1/mcp_http_stdio_proxy/internal/auth"
     "github.com/kwacky1/mcp_http_stdio_proxy/internal/proxy"
@@ -58,8 +60,18 @@ func main() {
         log.Fatalf("Configuration error: %v", err)
     }
 
+    // Setup context with cancellation for graceful shutdown
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
+
+    // Setup signal handling for graceful shutdown
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+    go func() {
+        sig := <-sigChan
+        log.Printf("Received shutdown signal: %v", sig)
+        cancel()
+    }()
 
     // Initialize auth handler
     authHandler := auth.NewHandler(config)
@@ -167,8 +179,39 @@ func main() {
         defaultProxy.ProxyMCP(w, r, token, botToken)
     })
 
-    log.Printf("Starting server on :8080")
-    if err := http.ListenAndServe(":8080", mux); err != nil {
-        log.Fatalf("Server failed to start: %v", err)
+    // Create server with timeout configuration
+    server := &http.Server{
+        Addr:         ":8080",
+        Handler:      mux,
+        ReadTimeout:  15 * time.Second,
+        WriteTimeout: 15 * time.Second,
+        IdleTimeout:  60 * time.Second,
     }
+
+    // Run server in a goroutine so we can handle shutdown
+    go func() {
+        log.Printf("Starting server on :8080")
+        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Printf("Server error: %v", err)
+        }
+    }()
+
+    // Wait for context cancellation (from signal handler)
+    <-ctx.Done()
+    log.Println("Shutting down server...")
+
+    // Create shutdown context with timeout
+    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer shutdownCancel()
+
+    // Attempt graceful shutdown
+    if err := server.Shutdown(shutdownCtx); err != nil {
+        log.Printf("Server shutdown error: %v", err)
+    }
+
+    // Ensure all cleanup is done
+    if defaultProxy != nil {
+        defaultProxy.Cleanup()
+    }
+    session.CleanupAll()
 }
