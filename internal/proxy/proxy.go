@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kwacky1/mcp_http_stdio_proxy/internal/session"
 )
 
 // Global mutex for STDIO operations
@@ -46,11 +48,9 @@ func (p *ProxyServer) startMCPServer(token string) error {
 
 	// Start new MCP server process with stdio parameter
 	cmd := exec.Command("/home/infra-admin/github-mcp-server/github-mcp-server", "stdio")
-	
-	// Set GITHUB_PERSONAL_ACCESS_TOKEN in the environment
 	cmd.Env = append(os.Environ(), fmt.Sprintf("GITHUB_PERSONAL_ACCESS_TOKEN=%s", token))
-	
-	// Setup stderr pipe to capture errors
+
+	// Setup pipes
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stderr pipe: %v", err)
@@ -81,7 +81,7 @@ func (p *ProxyServer) startMCPServer(token string) error {
 	p.stdin = stdin
 	p.stdout = stdout
 
-	// Monitor process stderr in background
+	// Monitor stderr in background
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
@@ -91,79 +91,58 @@ func (p *ProxyServer) startMCPServer(token string) error {
 
 	// Monitor process in background
 	go func() {
-		if err := cmd.Wait(); err != nil {
-			if err.Error() != "signal: killed" {
-				log.Printf("[WARN] MCP server process exited unexpectedly: %v", err)
-			}
+		if err := cmd.Wait(); err != nil && err.Error() != "signal: killed" {
+			log.Printf("[WARN] MCP server process exited unexpectedly: %v", err)
 		}
 	}()
 
-	// Initialize the server by sending an initialize request
+	// Initialize the server
 	initReq := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1,
 		"method":  "initialize",
 		"params": map[string]interface{}{
-			"mode":        "stdio",
+			"mode": "stdio",
 			"clientInfo": map[string]interface{}{
 				"name":    "MCP HTTP STDIO Proxy",
 				"version": "1.0.0",
 			},
 		},
 	}
-	
-	// Wait a bit for the server to start
+
+	// Wait for server startup and clear any pending output
 	time.Sleep(500 * time.Millisecond)
-	
 	reader := bufio.NewReader(stdout)
-	
-	// Check if there's any pending output
 	for {
-		available := false
-		if reader, ok := stdout.(interface{ Buffered() int }); ok {
-			available = reader.Buffered() > 0
-		}
-		
-		if !available {
+		if reader, ok := stdout.(interface{ Buffered() int }); !ok || reader.Buffered() == 0 {
 			break
 		}
-		
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[WARN] Error reading startup output: %v", err)
-			}
+		if _, err := reader.ReadString('\n'); err != nil {
 			break
 		}
-		log.Printf("[MCP stdout] Startup message: %s", line)
 	}
-	
-	log.Printf("[DEBUG] Sending initialize request")
-	
-	// Now send the initialize request
+
+	// Send initialize request
 	initReqBytes, _ := json.Marshal(initReq)
 	if _, err := stdin.Write(append(initReqBytes, '\n')); err != nil {
 		return fmt.Errorf("failed to send initialize request: %v", err)
 	}
 
-	// Read response with multiple retries
+	// Read response with retries
 	var initRespBytes []byte
 	var lastErr error
-	
 	for retries := 0; retries < 3; retries++ {
 		respChan := make(chan []byte, 1)
 		errChan := make(chan error, 1)
-		
+
 		go func() {
-			initRespBytes, err := reader.ReadBytes('\n')
-			if err != nil {
+			if bytes, err := reader.ReadBytes('\n'); err != nil {
 				errChan <- fmt.Errorf("failed to read initialize response: %v", err)
-				return
+			} else {
+				respChan <- bytes
 			}
-			respChan <- initRespBytes
 		}()
-		
-		// Wait for response with timeout
+
 		select {
 		case resp := <-respChan:
 			initRespBytes = resp
@@ -171,39 +150,29 @@ func (p *ProxyServer) startMCPServer(token string) error {
 			break
 		case err := <-errChan:
 			lastErr = err
-			log.Printf("[WARN] Initialize attempt %d failed: %v", retries+1, err)
-			time.Sleep(time.Second) // Wait before retry
-			continue
+			time.Sleep(time.Second)
 		case <-time.After(2 * time.Second):
 			lastErr = fmt.Errorf("timeout waiting for initialize response")
-			log.Printf("[WARN] Initialize attempt %d timed out", retries+1)
-			continue
 		}
-		
+
 		if lastErr == nil {
 			break
 		}
 	}
-	
+
 	if lastErr != nil {
 		return fmt.Errorf("failed to initialize after retries: %v", lastErr)
 	}
 
-	// Try to parse the response as JSON
-	trimmedResp := bytes.TrimSpace(initRespBytes)
-	log.Printf("[DEBUG] Initialize response: %q", string(trimmedResp))
-	
+	// Parse and validate response
 	var initResp map[string]interface{}
-	if err := json.Unmarshal(trimmedResp, &initResp); err != nil {
-		return fmt.Errorf("failed to parse initialize response: %v (raw: %q)", err, string(initRespBytes))
+	if err := json.Unmarshal(bytes.TrimSpace(initRespBytes), &initResp); err != nil {
+		return fmt.Errorf("failed to parse initialize response: %v", err)
 	}
 
-	// Check for initialization error
 	if errObj, hasError := initResp["error"]; hasError {
 		return fmt.Errorf("server initialization failed: %v", errObj)
 	}
-	
-	log.Printf("[INFO] Server initialized successfully")
 	return nil
 }
 
@@ -256,10 +225,16 @@ func (p *ProxyServer) ProxyMCP(w http.ResponseWriter, r *http.Request, userToken
 		return
 	}
 
-	// Debug logging
-	log.Printf("[DEBUG] Full request: %s", string(body))
 	log.Printf("[INFO] Received RPC method: %s (ID: %d)", request.Method, request.ID)
-	log.Printf("[DEBUG] User token present: %v", userToken != "")
+
+	// Try to get user token from Authorization header or session cookie
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		userToken = strings.TrimPrefix(authHeader, "Bearer ")
+	} else if cookie, err := r.Cookie(session.SessionCookie); err == nil {
+		if sess := session.Get(cookie.Value); sess != nil {
+			userToken = sess.AccessToken
+		}
+	}
 	
 	// Handle special methods that don't need proxying
 	switch request.Method {
@@ -299,94 +274,80 @@ func (p *ProxyServer) ProxyMCP(w http.ResponseWriter, r *http.Request, userToken
 		return
 	}
 	
-	// Check if request requires authentication - default to requiring auth
-	needsAuth := true
+	// Determine method name and if auth is required
 	methodName := request.Method
-
 	if request.Method == "tools/call" {
 		if params, ok := request.Params.(map[string]interface{}); ok {
 			if name, ok := params["name"].(string); ok {
 				methodName = name
-				log.Printf("[INFO] Tool name: %s", name)
 			}
 		}
 	}
 
-	// Only a few specific methods don't need auth
+	// Check if request requires authentication
 	noAuthMethods := map[string]bool{
 		"initialize":              true,
 		"notifications/initialized": true,
 		"tools/list":              true,
 	}
-
-	needsAuth = !noAuthMethods[methodName]
-	log.Printf("[DEBUG] Method %s requires auth: %v", methodName, needsAuth)
+	needsAuth := !noAuthMethods[methodName]
 
 	// For operations requiring auth, ensure we have a user token
 	if needsAuth && userToken == "" {
-		// Check for Bearer token in Authorization header
-		if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if strings.HasPrefix(token, "gho_") {
-				userToken = token
-				log.Printf("[DEBUG] Found valid GitHub token in Authorization header")
-				goto processRequest
-			}
-		}
-		
-		// Get the actual tool/method name that needs auth
-		methodName := request.Method
-		if request.Method == "tools/call" {
-			if params, ok := request.Params.(map[string]interface{}); ok {
-				if name, ok := params["name"].(string); ok {
-					methodName = name
+		log.Printf("[INFO] No valid auth token found, initiating auth flow for %s", methodName)
+
+		// If we still don't have a token, initiate auth flow
+		if userToken == "" {
+			// Get the actual tool/method name that needs auth
+			methodName := request.Method
+			if request.Method == "tools/call" {
+				if params, ok := request.Params.(map[string]interface{}); ok {
+					if name, ok := params["name"].(string); ok {
+						methodName = name
+					}
 				}
 			}
-		}
-		
-		log.Printf("[INFO] Initiating auth flow for %s", methodName)
-
-		// VS Code expects a 401 with WWW-Authenticate header to trigger auth
-		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="GitHub",authorization_uri="%s/oauth/authorize"`, p.serverURL))
-		w.WriteHeader(http.StatusUnauthorized)
-		
-		// VS Code specific error format
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"jsonrpc": "2.0",
-			"id":      request.ID,
-			"error": map[string]interface{}{
-				"code":    -32001,
-				"message": "Authorization required",
-				"data": map[string]interface{}{
-					"method": methodName,
-					"providerId": "github",
-					"scopes": []string{"user", "repo", "read:org"},
+			
+			log.Printf("[INFO] No valid auth token found, initiating auth flow for %s", methodName)
+			
+			// VS Code expects a specific error response format for auth
+			w.Header().Set("Content-Type", "application/json")
+			authError := map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      request.ID,
+				"error": map[string]interface{}{
+					"code":    -32001,
+					"message": "Authorization required",
+					"data": map[string]interface{}{
+						"providerId": "github",
+						"providerUrl": p.serverURL + "/.well-known/oauth-authorization-server",
+						"scopes":     []string{"user", "repo", "read:org"},
+					},
 				},
-			},
-		})
+			}
+			log.Printf("[DEBUG] Sending auth error response: %+v", authError)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(authError)
+			return
+		}
+	}
+
+	// Use bot token for non-auth operations, otherwise require user token
+	if !needsAuth {
+		userToken = botToken
+	} else if userToken == "" {
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
 		return
 	}
 
-processRequest:
-	// Select the appropriate token:
-	// - Use bot token for non-auth operations (listing tools, etc)
-	// - Use user token for authenticated operations (accessing GHES)
-	token := botToken
-	if needsAuth {
-		token = userToken
-		log.Printf("[DEBUG] Using user token for authenticated operation: %s", request.Method)
-	}
-
 	// Restart the server if using a different token
-	if p.cmd != nil && token != p.botToken {
-		log.Printf("[DEBUG] Restarting MCP server with new token")
-		if err := p.startMCPServer(token); err != nil {
-			log.Printf("[ERROR] Failed to restart MCP server with new token: %v", err)
+	if p.cmd != nil && userToken != p.botToken {
+		if err := p.startMCPServer(userToken); err != nil {
+			log.Printf("[ERROR] Failed to restart MCP server: %v", err)
 			http.Error(w, "Failed to proxy request", http.StatusInternalServerError)
 			return
 		}
-		p.botToken = token // Update the token so we don't restart unnecessarily
+		p.botToken = userToken
 	}
 
 	// Lock for STDIO operations
@@ -394,11 +355,8 @@ processRequest:
 	defer mu.Unlock()
 
 	// Try to write request, restart process if pipe is broken
-	log.Printf("[DEBUG] Writing request to STDIN: %s", string(body))
-	_, err = p.stdin.Write(append(body, '\n'))
-	if err != nil {
-		log.Printf("[WARN] Failed to write to STDIN: %v, attempting to restart MCP server", err)
-		if err := p.startMCPServer(token); err != nil {
+	if _, err = p.stdin.Write(append(body, '\n')); err != nil {
+		if err := p.startMCPServer(userToken); err != nil {
 			log.Printf("[ERROR] Failed to restart MCP server: %v", err)
 			http.Error(w, "Failed to proxy request", http.StatusInternalServerError)
 			return
@@ -417,20 +375,16 @@ processRequest:
 	errChan := make(chan error, 1)
 
 	go func() {
-		respBytes, err := reader.ReadBytes('\n')
-		if err != nil {
+		if bytes, err := reader.ReadBytes('\n'); err != nil {
 			errChan <- err
-			return
+		} else {
+			respChan <- bytes
 		}
-		respChan <- respBytes
 	}()
 
 	var respBytes []byte
-
-	// Wait for response with timeout
 	select {
-	case rb := <-respChan:
-		respBytes = rb
+	case respBytes = <-respChan:
 	case err := <-errChan:
 		log.Printf("[ERROR] Failed to read from STDOUT: %v", err)
 		http.Error(w, "Failed to read proxy response", http.StatusInternalServerError)
@@ -441,20 +395,16 @@ processRequest:
 		return
 	}
 
-	// Verify the response is valid JSON and trim any whitespace/newlines
+	// Validate JSON response
 	trimmedResp := bytes.TrimSpace(respBytes)
 	var jsonResp map[string]interface{}
 	if err := json.Unmarshal(trimmedResp, &jsonResp); err != nil {
-		log.Printf("[ERROR] Invalid JSON response from MCP server: %s - %v", trimmedResp, err)
+		log.Printf("[ERROR] Invalid JSON response: %v", err)
 		http.Error(w, "Invalid response from proxy", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[DEBUG] Response from STDOUT: %s", string(trimmedResp))
-
-	// Set response headers
+	// Return response
 	w.Header().Set("Content-Type", "application/json")
-
-	// Write the response
 	w.Write(trimmedResp)
 }

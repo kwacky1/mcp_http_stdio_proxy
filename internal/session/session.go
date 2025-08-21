@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -77,13 +78,19 @@ func Create(token, redirectURI string) (string, error) {
 	}
 
 	sessionStore[sessionID] = session
+	log.Printf("[DEBUG] Created new session - ID: %s, URI: %s", sessionID, redirectURI)
 	return sessionID, nil
 }
 
-// generateID generates a random session ID
-func generateID() string {
+// GenerateID generates a random session ID
+func GenerateID() string {
 	// In a production system, use a more secure method
 	return fmt.Sprintf("%s_%d", time.Now().Format("20060102150405"), time.Now().UnixNano())
+}
+
+// generateID is an internal alias for GenerateID
+func generateID() string {
+	return GenerateID()
 }
 
 // Get retrieves a session by ID
@@ -92,8 +99,11 @@ func Get(id string) *Session {
 	defer sessionMu.Unlock()
 	if session := sessionStore[id]; session != nil {
 		session.LastAccess = time.Now()
+		log.Printf("[DEBUG] Retrieved active session - ID: %s, Token: %s***, Last Access: %v", 
+			id, session.AccessToken[:10], session.LastAccess)
 		return session
 	}
+	log.Printf("[DEBUG] No session found for ID: %s", id)
 	return nil
 }
 
@@ -124,4 +134,13 @@ func StartCleanupRoutine(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// CleanupAll removes all sessions from the store
+func CleanupAll() {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	for id := range sessionStore {
+		delete(sessionStore, id)
+	}
 }

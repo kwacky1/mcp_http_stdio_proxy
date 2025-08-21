@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,13 +82,31 @@ func (h *Handler) getUserInstallations(token string) ([]map[string]interface{}, 
 func (h *Handler) getInstallationToken(jwt string, installationID string) (string, error) {
 	url := fmt.Sprintf("%s/api/v3/app/installations/%s/access_tokens", h.config.GithubHost, installationID)
 	
-	req, err := http.NewRequest("POST", url, nil)
+	// Request specific permissions
+	data := map[string]interface{}{
+		"permissions": map[string]string{
+			"metadata": "read",
+			"contents": "write",
+			"issues": "write",
+			"pull_requests": "write",
+			"members": "read", // Required for /user endpoint
+		},
+		"repository_ids": []int{}, // Empty array means all repositories
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", url, io.NopCloser(bytes.NewBuffer(jsonData)))
 	if err != nil {
 		return "", fmt.Errorf("create request: %v", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{}
 	resp, err := client.Do(req)

@@ -10,6 +10,7 @@ import (
     "os/signal"
     "strings"
     "syscall"
+    "time"
 
     "github.com/kwacky1/mcp_http_stdio_proxy/internal/auth"
     "github.com/kwacky1/mcp_http_stdio_proxy/internal/proxy"
@@ -27,15 +28,19 @@ func validateConfig(config auth.Config) error {
     if config.AppID == "" {
         return fmt.Errorf("GITHUB_APP_ID is required")
     }
+    if config.AppSlug == "" {
+        return fmt.Errorf("GITHUB_APP_SLUG is required")
+    }
     if config.ClientID == "" {
         return fmt.Errorf("GITHUB_CLIENT_ID is required")
     }
-    if config.ClientSecret == "" {
-        return fmt.Errorf("GITHUB_CLIENT_SECRET is required")
+    if !strings.HasPrefix(config.ClientID, "Iv1.") {
+        return fmt.Errorf("GITHUB_CLIENT_ID must start with 'Iv1.'")
     }
     if config.PrivateKey == "" && config.PrivateKeyPath == "" {
         return fmt.Errorf("either GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_PATH is required")
     }
+    log.Printf("[INFO] Using GitHub client ID: %s", config.ClientID)
     return nil
 }
 
@@ -43,11 +48,11 @@ var (
     config = auth.Config{
         AppID:          os.Getenv("GITHUB_APP_ID"),
         AppSlug:        os.Getenv("GITHUB_APP_SLUG"),
-        ClientID:       os.Getenv("OAUTH_CLIENT_ID"),
-        ClientSecret:   os.Getenv("OAUTH_CLIENT_SECRET"),
+        ClientID:       os.Getenv("GITHUB_CLIENT_ID"),  // Get from environment
+        ClientSecret:   os.Getenv("GITHUB_CLIENT_SECRET"),  // Get client secret from environment
         PrivateKey:     os.Getenv("GITHUB_PRIVATE_KEY"),
         PrivateKeyPath: os.Getenv("GITHUB_PRIVATE_KEY_PATH"),
-        GithubHost:     getEnvOrDefault("GITHUB_HOST", "https://github.com"),
+        GithubHost:     getEnvOrDefault("GITHUB_HOST", "https://git.ethernest.com"),
         ServerURL:      getEnvOrDefault("MCP_HOST", "http://localhost:8080"),
     }
     botToken      = os.Getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
@@ -91,25 +96,47 @@ func main() {
     mux := http.NewServeMux()
 
     // Register auth endpoints first to ensure they take precedence
-    mux.HandleFunc("/.well-known/openid-configuration", authHandler.OpenIDConfig)
-    mux.HandleFunc("/register", authHandler.Register)
+    // VS Code discovery endpoint
+    mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+        log.Printf("[DEBUG] Serving discovery endpoint")
+        clientID := authHandler.GetClientID()
+        log.Printf("[DEBUG] Using client ID: %s", clientID)
+
+        serverURL := authHandler.GetServerURL()
+		config := map[string]interface{}{
+			"issuer":                            serverURL,
+			"authorization_endpoint":            fmt.Sprintf("%s/oauth/authorize", serverURL),
+			"token_endpoint":                   fmt.Sprintf("%s/oauth/token", serverURL),
+			"userinfo_endpoint":               fmt.Sprintf("%s/oauth/userinfo", serverURL),
+			"scopes_supported":                 []string{"user", "repo", "read:org"},
+			"response_types_supported":         []string{"code"},
+			"token_endpoint_auth_methods_supported": []string{"none"},
+			"code_challenge_methods_supported": []string{"S256"},
+			"grant_types_supported":           []string{"authorization_code"},
+			"client_id":                       clientID,
+		}
+		
+		log.Printf("[DEBUG] Discovery request from User-Agent: %s", r.Header.Get("User-Agent"))
+		log.Printf("[DEBUG] Discovery request headers: %+v", r.Header)
+		
+		w.Header().Set("Content-Type", "application/json")
+        if err := json.NewEncoder(w).Encode(config); err != nil {
+            log.Printf("[ERROR] Failed to encode discovery response: %v", err)
+        } else {
+            log.Printf("[DEBUG] Successfully served discovery endpoint")
+        }
+    })    // OAuth endpoints
     mux.HandleFunc("/oauth/authorize", authHandler.Authorize)
-    mux.HandleFunc("/authorize", authHandler.Authorize) // Support both paths
-    mux.HandleFunc("/app/installations/new", authHandler.Authorize) // Handle direct app installation path
     mux.HandleFunc("/oauth/callback", authHandler.Callback)
     mux.HandleFunc("/oauth/token", authHandler.Token)
-    mux.HandleFunc("/app/installations/token", authHandler.Token) // Also handle VS Code'\''s token endpoint
-    mux.HandleFunc("/oauth/userinfo", authHandler.UserInfo)
+    mux.HandleFunc("/oauth/register", authHandler.Register)  // Add registration endpoint
 
     mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
         // Only allow specific paths
         allowedPaths := []string{
             "/",               // Root path for MCP requests
-            "/.well-known/",  // OpenID configuration
-            "/oauth/",        // OAuth endpoints
-            "/authorize",     // Auth endpoints
-            "/register",      // Registration endpoint
-            "/app/",         // GitHub App endpoints
+            "/.well-known/",  // OAuth discovery endpoint
+            "/oauth/",        // OAuth endpoints including registration
         }
 
         pathAllowed := false
@@ -128,15 +155,7 @@ func main() {
 
         log.Printf("Incoming request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
         
-        // Ignore GET requests to paths that should be handled by auth endpoints
-        if r.Method == "GET" && (
-            strings.HasPrefix(r.URL.Path, "/.well-known/") ||
-            strings.HasPrefix(r.URL.Path, "/oauth/") ||
-            strings.HasPrefix(r.URL.Path, "/authorize") ||
-            strings.HasPrefix(r.URL.Path, "/register")) {
-            http.NotFound(w, r)
-            return
-        }
+        // No need to explicitly ignore OAuth-related GET requests as they are handled by the mux
         
         // For POST requests, ensure it's JSON content
         if r.Method == "POST" {

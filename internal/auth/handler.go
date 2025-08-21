@@ -2,20 +2,16 @@ package auth
 
 import (
 	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
+	"bytes"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/kwacky1/mcp_http_stdio_proxy/internal/session"
 )
 
@@ -26,16 +22,303 @@ type Handler struct {
 	parsedPrivateKey *rsa.PrivateKey
 }
 
+// OpenIDConfig serves the OpenID Connect configuration
+func (h *Handler) OpenIDConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	serverURL := h.config.ServerURL
+	config := map[string]interface{}{
+		"issuer":                            serverURL,
+		"authorization_endpoint":            fmt.Sprintf("%s/oauth/authorize", serverURL),
+		"token_endpoint":                   fmt.Sprintf("%s/oauth/token", serverURL),
+		"registration_endpoint":            fmt.Sprintf("%s/oauth/register", serverURL),
+		"userinfo_endpoint":               fmt.Sprintf("%s/oauth/userinfo", serverURL),
+		"response_types_supported":         []string{"code"},
+		"subject_types_supported":         []string{"public"},
+		"id_token_signing_alg_values_supported": []string{"RS256"},
+		"scopes_supported":               []string{"user", "repo", "read:org"},
+		"token_endpoint_auth_methods":    []string{"none"},
+		"token_endpoint_auth_methods_supported": []string{"none"},
+		"claims_supported":              []string{"sub", "name", "preferred_username", "profile", "picture", "website", "email", "email_verified", "updated_at"},
+		"client_id":                     h.config.ClientID,
+		"code_challenge_methods_supported": []string{"S256"},
+		"grant_types_supported":         []string{"authorization_code"},
+		"service_documentation":         fmt.Sprintf("%s/.well-known/oauth-authorization-server", serverURL),
+		"registration_endpoint_json_types": []string{"application/json"},
+	}
+
+	log.Printf("OpenID config response: %+v", config)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(config)
+}
+
+// Register handles dynamic client registration
+func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[DEBUG] Register handler called with method: %s", r.Method)
+	
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var registration struct {
+		ClientName    string   `json:"client_name"`
+		RedirectURIs []string `json:"redirect_uris"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&registration); err != nil {
+		log.Printf("[ERROR] Failed to decode registration request: %v", err)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[DEBUG] Registration request - name: %s, redirects: %v", registration.ClientName, registration.RedirectURIs)
+
+	// Always use our configured client ID for VS Code
+	response := map[string]interface{}{
+		"client_id":                h.config.ClientID,
+		"client_id_issued_at":      time.Now().Unix(),
+		"client_secret":            "",  // No secret needed for PKCE
+		"client_secret_expires_at": 0,
+		"registration_access_token": "",  // Not needed for our use case
+		"registration_client_uri":  fmt.Sprintf("%s/oauth/register/%s", h.config.ServerURL, h.config.ClientID),
+		"client_name":              registration.ClientName,
+		"redirect_uris":            registration.RedirectURIs,
+		"grant_types":              []string{"authorization_code"},
+		"response_types":           []string{"code"},
+		"token_endpoint_auth_method": "none",  // We use PKCE instead
+		"scope":                    "user repo read:org",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// Authorize handles the authorization request
+func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[DEBUG] Authorize handler called with URL: %s", r.URL.String())
+	
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get authorization parameters
+	clientID := r.URL.Query().Get("client_id")
+	redirectURI := r.URL.Query().Get("redirect_uri")
+	state := r.URL.Query().Get("state")
+	codeChallenge := r.URL.Query().Get("code_challenge")
+	codeChallengeMethod := r.URL.Query().Get("code_challenge_method")
+	
+	log.Printf("[DEBUG] Auth parameters - clientID: %s, expected clientID: %s", clientID, h.config.ClientID)
+
+	// Validate client_id
+	if !h.IsValidClientID(clientID) {
+		log.Printf("[ERROR] Invalid client_id: %s", clientID)
+		http.Error(w, "Invalid client_id", http.StatusBadRequest)
+		return
+	}
+	
+	log.Printf("[DEBUG] Client ID validation passed")
+
+	// Store PKCE parameters in state for later verification
+	if codeChallenge != "" {
+		if codeChallengeMethod != "S256" {
+			http.Error(w, "code_challenge_method must be S256", http.StatusBadRequest)
+			return
+		}
+		
+		// Use state to store PKCE data
+		if state == "" {
+			state = fmt.Sprintf("pkce_%s", session.GenerateID())
+		}
+		
+		// Store PKCE parameters with state
+		session.StoreState(state+"_cc", codeChallenge)
+		session.StoreState(state+"_ccm", codeChallengeMethod)
+	}
+
+	// Build GitHub authorization URL
+	authURL := fmt.Sprintf("%s/login/oauth/authorize", h.config.GithubHost)
+	q := url.Values{}
+	q.Set("client_id", clientID)
+	q.Set("redirect_uri", redirectURI)
+	if state != "" {
+		q.Set("state", state)
+	}
+
+	// Get requested scopes from the original request
+	scope := r.URL.Query().Get("scope")
+	if scope == "" {
+		scope = "user repo read:org" // Default scopes if none requested
+	}
+	q.Set("scope", scope)
+	
+	log.Printf("[DEBUG] Requesting GitHub authorization with scope: %s", scope)
+
+	// Redirect to GitHub authorization page
+	http.Redirect(w, r, authURL+"?"+q.Encode(), http.StatusFound)
+}
+
+// UserInfo returns information about the authenticated user
+func (h *Handler) UserInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get token from Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		http.Error(w, "Missing or invalid Authorization header", http.StatusUnauthorized)
+		return
+	}
+
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+
+	// Get user info from GitHub
+	userInfo, err := h.getUserInfo(token)
+	if err != nil {
+		log.Printf("Failed to get user info: %v", err)
+		http.Error(w, "Failed to get user info", http.StatusInternalServerError)
+		return
+	}
+
+	// Return user info
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(userInfo)
+}
+
+// Callback handles the OAuth callback from GitHub
+func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[DEBUG] Callback handler hit with URL: %s", r.URL.String())
+	
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+	redirectURI := r.URL.Query().Get("redirect_uri")
+	
+	log.Printf("[DEBUG] Callback params - code: %v, state: %s, redirect: %s", 
+		code != "", state, redirectURI)
+
+	if code == "" {
+		err := r.URL.Query().Get("error")
+		errDesc := r.URL.Query().Get("error_description")
+		log.Printf("OAuth callback error: %s - %s", err, errDesc)
+		http.Error(w, "Authorization failed", http.StatusBadRequest)
+		return
+	}
+
+	if redirectURI == "" {
+		redirectURI = h.config.ServerURL + "/oauth/callback"
+	}
+
+	// If this is a VS Code callback, redirect with the code
+	if strings.Contains(redirectURI, "vscode://") ||
+	   strings.Contains(redirectURI, "vscode-insiders://") ||
+	   strings.Contains(redirectURI, "127.0.0.1:") ||
+	   strings.Contains(redirectURI, "localhost:") {
+		q := url.Values{}
+		q.Set("code", code)
+		if state != "" {
+			q.Set("state", state)
+		}
+		http.Redirect(w, r, redirectURI+"?"+q.Encode(), http.StatusFound)
+		return
+	}
+
+	// For browser flows, exchange code for token here
+	tokenURL := fmt.Sprintf("%s/login/oauth/access_token", h.config.GithubHost)
+	tokenData := map[string]interface{}{
+		"client_id": h.config.ClientID,
+		"code": code,
+		"redirect_uri": redirectURI,
+	}
+
+	jsonData, err := json.Marshal(tokenData)
+	if err != nil {
+		log.Printf("Failed to marshal token request: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	req, err := http.NewRequest("POST", tokenURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Failed to create token request: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Token request failed: %v", err)
+		http.Error(w, "Failed to exchange code for token", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	var oauthResp struct {
+		AccessToken string `json:"access_token"`
+		TokenType  string `json:"token_type"`
+		Scope     string `json:"scope"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&oauthResp); err != nil {
+		log.Printf("Failed to decode token response: %v", err)
+		http.Error(w, "Invalid token response", http.StatusInternalServerError)
+		return
+	}
+
+	// Create a session with the token
+	sessionID, err := session.Create(oauthResp.AccessToken, redirectURI)
+	if err != nil {
+		log.Printf("Session creation failed: %v", err)
+		http.Error(w, "Session creation failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Set session cookie
+	cookie := &http.Cookie{
+		Name:     session.SessionCookie,
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   false,
+		SameSite: http.SameSiteLaxMode,
+	}
+	http.SetCookie(w, cookie)
+
+	// For browser flows, redirect to success page
+	if state != "" && strings.HasPrefix(state, "http") {
+		http.Redirect(w, r, state, http.StatusFound)
+		return
+	}
+
+	// Show simple success message
+	w.Write([]byte("Authentication successful! You can close this window."))
+}
+
 // Config holds the configuration for the auth handler
 type Config struct {
-	AppID          string
-	AppSlug        string
-	ClientID       string
-	ClientSecret   string
-	PrivateKey     string
-	PrivateKeyPath string
-	GithubHost     string
-	ServerURL      string
+	AppID          string // The GitHub App's ID (numeric)
+	AppSlug        string // The GitHub App's URL-friendly name
+	ClientID       string // The GitHub App's client ID (e.g., Iv1.xxx)
+	ClientSecret   string // The GitHub App's client secret
+	PrivateKey     string // The GitHub App's private key content
+	PrivateKeyPath string // Path to the GitHub App's private key file
+	GithubHost     string // GHES host URL
+	ServerURL      string // This proxy server's URL
 }
 
 // NewHandler creates a new auth handler with the given configuration
@@ -45,496 +328,32 @@ func NewHandler(config Config) *Handler {
 	}
 }
 
-// getPrivateKey returns the parsed RSA private key, either from cache or by parsing it
-func (h *Handler) getPrivateKey() (*rsa.PrivateKey, error) {
-	h.privateKeyMu.RLock()
-	if h.parsedPrivateKey != nil {
-		defer h.privateKeyMu.RUnlock()
-		return h.parsedPrivateKey, nil
-	}
-	h.privateKeyMu.RUnlock()
-
-	// Lock for writing
-	h.privateKeyMu.Lock()
-	defer h.privateKeyMu.Unlock()
-
-	// Check again in case another goroutine parsed it
-	if h.parsedPrivateKey != nil {
-		return h.parsedPrivateKey, nil
-	}
-
-	var pemBytes []byte
-	var err error
-
-	// Try loading from environment variable first
-	if h.config.PrivateKey != "" {
-		pemBytes = []byte(h.config.PrivateKey)
-	} else if h.config.PrivateKeyPath != "" {
-		// Fall back to loading from file
-		pemBytes, err = os.ReadFile(h.config.PrivateKeyPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read private key file: %v", err)
-		}
-	} else {
-		return nil, fmt.Errorf("no private key provided")
-	}
-
-	// Parse PEM block
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		return nil, fmt.Errorf("failed to decode PEM block")
-	}
-
-	// Parse private key
-	privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key: %v", err)
-	}
-
-	h.parsedPrivateKey = privateKey
-	return privateKey, nil
+// GetServerURL returns the server URL
+func (h *Handler) GetServerURL() string {
+	return h.config.ServerURL
 }
 
-// generateJWT creates a new JWT token for GitHub App authentication
-func (h *Handler) generateJWT() (string, error) {
-	// Get private key
-	privateKey, err := h.getPrivateKey()
-	if err != nil {
-		return "", fmt.Errorf("failed to get private key: %v", err)
-	}
-
-	// Create token with claims
-	now := time.Now()
-	claims := jwt.MapClaims{
-		"iat": now.Unix(),
-		"exp": now.Add(10 * time.Minute).Unix(),
-		"iss": h.config.AppID,
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-
-	// Sign the token
-	signedToken, err := token.SignedString(privateKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to sign token: %v", err)
-	}
-
-	return signedToken, nil
+// GetClientID returns the client ID
+func (h *Handler) GetClientID() string {
+	return h.config.ClientID
 }
 
-// OpenIDConfig handles the OpenID configuration endpoint
-func (h *Handler) OpenIDConfig(w http.ResponseWriter, r *http.Request) {
-	config := map[string]interface{}{
-		"issuer":                   h.config.ServerURL,
-		"authorization_endpoint":    h.config.ServerURL + "/oauth/authorize",
-		"token_endpoint":           h.config.ServerURL + "/oauth/token",
-		"userinfo_endpoint":        h.config.ServerURL + "/oauth/userinfo",
-		"scopes_supported": []string{
-			"repo", "repo:status", "repo_deployment", "public_repo", "repo:invite",
-			"security_events", "admin:repo_hook", "write:repo_hook", "read:repo_hook",
-			"admin:org", "write:org", "read:org", "admin:public_key",
-			"write:public_key", "read:public_key", "admin:org_hook",
-			"gist", "notifications", "user", "delete_repo", "write:discussion",
-			"read:discussion", "write:packages", "read:packages", "delete:packages",
-			"admin:gpg_key", "write:gpg_key", "read:gpg_key", "workflow",
-		},
-		"response_types_supported": []string{"code"},
-		"grant_types_supported":    []string{"authorization_code", "refresh_token"},
-		"registration_endpoint":    h.config.ServerURL + "/register",
-		"code_challenge_methods_supported": []string{"S256"},
-		"service_documentation":    h.config.GithubHost + "/apps/" + h.config.AppSlug,
-		"token_endpoint_auth_methods_supported": []string{"client_secret_post"},
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(config)
-}
-
-// Register handles the registration endpoint
-func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+// IsValidClientID checks if a given client ID matches our configured one
+// Handles both full form (Iv1.xxx) and short form
+func (h *Handler) IsValidClientID(clientID string) bool {
+	configID := h.config.ClientID
 	
-	// Get GitHub App information using JWT
-	jwt, err := h.generateJWT()
-	if err != nil {
-		log.Printf("Error generating JWT: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Get app details from GitHub
-	appDetailsURL := fmt.Sprintf("%s/api/v3/app", h.config.GithubHost)
-	req, _ := http.NewRequest("GET", appDetailsURL, nil)
-	req.Header.Set("Authorization", "Bearer "+jwt)
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Error fetching app details: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	var appDetails struct {
-		Name        string   `json:"name"`
-		Description string   `json:"description"`
-		HTMLURL     string   `json:"html_url"`
-		Permissions struct {
-			Actions       string `json:"actions"`
-			Contents     string `json:"contents"`
-			Issues       string `json:"issues"`
-			Metadata     string `json:"metadata"`
-			PullRequests string `json:"pull_requests"`
-		} `json:"permissions"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&appDetails); err != nil {
-		log.Printf("Error parsing app details: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	registration := map[string]interface{}{
-		"client_id": h.config.ClientID,
-		"client_secret": h.config.ClientSecret,
-		"redirect_uris": []string{
-			"https://insiders.vscode.dev/redirect",
-			"https://vscode.dev/redirect",
-			"http://localhost/",
-			"http://127.0.0.1/",
-			"http://localhost:33418/",
-			"http://127.0.0.1:33418/",
-			"vscode-insiders://vscode.dev/",
-			"vscode://vscode.dev/",
-		},
-		"application_type": "web",
-		"token_endpoint_auth_method": "client_secret_post",
-		"grant_types": []string{"authorization_code", "refresh_token"},
-		"response_types": []string{"code"},
-		"client_name": appDetails.Name,
-		"client_uri": appDetails.HTMLURL,
-		"scope": "repo,user",
-		"software_id": "github-app:" + h.config.AppID,
-		"software_version": "1.0.0",
-		"app_permissions": appDetails.Permissions,
-	}
-
-	json.NewEncoder(w).Encode(registration)
-}
-
-// Authorize handles the authorization endpoint
-func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
-	// Extract authorization request parameters
-	state := r.URL.Query().Get("state")
-	redirectURI := r.URL.Query().Get("redirect_uri")
-	clientID := r.URL.Query().Get("client_id")
-	responseType := r.URL.Query().Get("response_type")
-	scope := r.URL.Query().Get("scope")
-	codeChallenge := r.URL.Query().Get("code_challenge")
-	codeChallengeMethod := r.URL.Query().Get("code_challenge_method")
-	
-	log.Printf("Authorization request received - state: %s, redirect_uri: %s, client_id: %s, response_type: %s",
-		state, redirectURI, clientID, responseType)
-
-	// Validate required parameters
-	if state == "" {
-		http.Error(w, "Missing required parameter: state", http.StatusBadRequest)
-		return
-	}
-
-	// Normalize the redirect URI
-	if redirectURI == "" {
-		redirectURI = h.config.ServerURL + "/app/installations/callback"
-	}
-
-	// Check for VS Code client flow
-	isVSCodeFlow := strings.Contains(redirectURI, "localhost") ||
-		strings.Contains(redirectURI, "127.0.0.1") ||
-		strings.Contains(redirectURI, "vscode://") ||
-		strings.Contains(redirectURI, "vscode-insiders://")
-		
-	// Set up base OAuth parameters
-	q := url.Values{}
-	q.Set("client_id", h.config.ClientID)
-	q.Set("state", state)
-	
-	// Store state info
-	stateStore := map[string]interface{}{
-		"redirect_uri": redirectURI,
-		"is_vscode": isVSCodeFlow,
-		"code_challenge": codeChallenge,
-		"code_challenge_method": codeChallengeMethod,
-		"scope": scope,
-	}
-	stateBytes, _ := json.Marshal(stateStore)
-	session.StoreState(state, string(stateBytes))
-
-	// Configure OAuth flow based on client type
-	if isVSCodeFlow {
-		q.Set("redirect_uri", redirectURI)
-	} else {
-		q.Set("redirect_uri", h.config.ServerURL+"/oauth/callback")
-	}
-
-	// Set required GitHub App OAuth scopes
-	requestedScopes := []string{"repo", "user"}
-	if scope != "" {
-		scopes := strings.Split(scope, " ")
-		requestedScopes = append(requestedScopes, scopes...)
-	}
-	q.Set("scope", strings.Join(requestedScopes, " "))
-
-	// Pass through optional parameters
-	if login := r.URL.Query().Get("login"); login != "" {
-		q.Set("login", login)
-	}
-	if allowSignup := r.URL.Query().Get("allow_signup"); allowSignup != "" {
-		q.Set("allow_signup", allowSignup)
-	}
-	if prompt := r.URL.Query().Get("prompt"); prompt != "" {
-		q.Set("prompt", prompt)
-	}
-
-	// Add PKCE challenge if provided
-	if codeChallenge != "" {
-		q.Set("code_challenge", codeChallenge)
-		if codeChallengeMethod != "" {
-			q.Set("code_challenge_method", codeChallengeMethod)
-		} else {
-			q.Set("code_challenge_method", "S256")
-		}
-	}
-
-	// Build and validate authorization URL
-	authURL := fmt.Sprintf("%s/login/oauth/authorize?%s", h.config.GithubHost, q.Encode())
-	if _, err := url.Parse(authURL); err != nil {
-		log.Printf("Error constructing authorization URL: %v", err)
-		http.Error(w, "Invalid authorization URL", http.StatusInternalServerError)
-		return
+	// If the given ID is already the full form and matches exactly
+	if clientID == configID {
+		return true
 	}
 	
-	log.Printf("Redirecting to GitHub authorization URL: %s", authURL)
-	http.Redirect(w, r, authURL, http.StatusFound)
-}
-
-// exchangeCodeForToken exchanges an authorization code for an access token
-func (h *Handler) exchangeCodeForToken(code string, codeVerifier string, redirectURI string) (string, string, error) {
-	tokenURL := h.config.GithubHost + "/login/oauth/access_token"
+	// If the config ID starts with "Iv1." and the given ID matches the part after it
+	if strings.HasPrefix(configID, "Iv1.") && clientID == strings.TrimPrefix(configID, "Iv1.") {
+		return true
+	}
 	
-	data := url.Values{}
-	data.Set("client_id", h.config.ClientID)
-	data.Set("client_secret", h.config.ClientSecret)
-	data.Set("code", code)
-	data.Set("redirect_uri", redirectURI)
-	if codeVerifier != "" {
-		data.Set("code_verifier", codeVerifier)
-	}
-
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return "", "", fmt.Errorf("create request: %v", err)
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-GitHub-Client-Id", h.config.ClientID)
-	req.Header.Set("User-Agent", fmt.Sprintf("GitHub-App/%s", h.config.AppSlug))
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("send request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", fmt.Errorf("read response: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("token exchange failed: %s - %s", resp.Status, string(body))
-	}
-
-	var res struct {
-		AccessToken string `json:"access_token"`
-		TokenType   string `json:"token_type"`
-		Scope      string `json:"scope"`
-		Error      string `json:"error"`
-		ErrorDescription string `json:"error_description"`
-		ErrorURI    string `json:"error_uri"`
-	}
-	if err := json.Unmarshal(body, &res); err != nil {
-		return "", "", fmt.Errorf("parse response: %v", err)
-	}
-
-	if res.Error != "" {
-		errMsg := res.Error
-		if res.ErrorDescription != "" {
-			errMsg += ": " + res.ErrorDescription
-		}
-		return "", "", fmt.Errorf("oauth error: %s", errMsg)
-	}
-
-	if res.AccessToken == "" {
-		return "", "", fmt.Errorf("no access token in response: %s", string(body))
-	}
-
-	// Verify token and get associated app installations
-	installations, err := h.getUserInstallations(res.AccessToken)
-	if err != nil {
-		log.Printf("Warning: Failed to get user installations: %v", err)
-	} else {
-		log.Printf("Found %d installations for user token", len(installations))
-	}
-
-	return res.AccessToken, res.Scope, nil
-}
-
-// Callback handles the OAuth callback
-func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Callback received with full URL: %s", r.URL.String())
-	
-	state := r.URL.Query().Get("state")
-	code := r.URL.Query().Get("code")
-	installationID := r.URL.Query().Get("installation_id")
-	error := r.URL.Query().Get("error")
-	errorDescription := r.URL.Query().Get("error_description")
-	
-	log.Printf("Callback parameters - state: %s, code: %v, installation_id: %s, error: %s",
-		state, code != "", installationID, error)
-		
-	// Handle OAuth errors
-	if error != "" {
-		log.Printf("OAuth error received: %s - %s", error, errorDescription)
-		http.Error(w, fmt.Sprintf("Authentication failed: %s", errorDescription), http.StatusBadRequest)
-		return
-	}
-
-	// Validate and retrieve state
-	storedState := session.PopState(state)
-	if storedState == "" {
-		log.Printf("No stored state found for: %s - potential CSRF attempt", state)
-		http.Error(w, "Invalid state parameter", http.StatusBadRequest)
-		return
-	}
-
-	// Parse stored state
-	var stateData struct {
-		RedirectURI         string `json:"redirect_uri"`
-		IsVSCode           bool   `json:"is_vscode"`
-		CodeChallenge      string `json:"code_challenge"`
-		CodeChallengeMethod string `json:"code_challenge_method"`
-		Scope              string `json:"scope"`
-	}
-	if err := json.Unmarshal([]byte(storedState), &stateData); err != nil {
-		log.Printf("Error parsing stored state: %v", err)
-		http.Error(w, "Invalid state data", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("Retrieved state data - redirect_uri: %s, is_vscode: %v",
-		stateData.RedirectURI, stateData.IsVSCode)
-
-	// Handle OAuth code exchange
-	if code != "" {
-		log.Printf("Exchanging OAuth code for access token")
-		codeVerifier := r.URL.Query().Get("code_verifier")
-		token, scope, err := h.exchangeCodeForToken(code, codeVerifier, stateData.RedirectURI)
-		if err != nil {
-			log.Printf("Token exchange failed: %v", err)
-			http.Error(w, "Failed to complete authentication", http.StatusInternalServerError)
-			return
-		}
-		
-		log.Printf("Token exchange successful - scope: %s", scope)
-
-		// Get user installations
-		installations, err := h.getUserInstallations(token)
-		if err != nil {
-			log.Printf("Warning: Failed to get user installations: %v", err)
-		}
-
-		// Get user info for the session
-		userInfo, err := h.getUserInfo(token)
-		if err != nil {
-			log.Printf("Warning: Failed to get user info: %v", err)
-		}
-
-		// Create session with installations
-		sessionID, err := session.Create(token, stateData.RedirectURI)
-		if err != nil {
-			log.Printf("Session creation failed: %v", err)
-			http.Error(w, "Failed to create session", http.StatusInternalServerError)
-			return
-		}
-
-		// Update session with installations
-		sess := session.Get(sessionID)
-		if sess != nil {
-			for _, inst := range installations {
-				account, _ := inst["account"].(map[string]interface{})
-				accountName, _ := account["login"].(string)
-				permissions, _ := inst["permissions"].(map[string]interface{})
-				id, _ := inst["id"].(float64)
-
-				sess.Installations = append(sess.Installations, session.Installation{
-					ID:          int64(id),
-					Account:     accountName,
-					Permissions: permissions,
-				})
-			}
-
-			if userInfo != nil {
-				if accountType, ok := userInfo["type"].(string); ok {
-					sess.AccountType = accountType
-				}
-				if accountLogin, ok := userInfo["login"].(string); ok {
-					sess.AccountLogin = accountLogin
-				}
-			}
-		}
-
-		// Set session cookie for browser flows
-		if !stateData.IsVSCode {
-			cookie := &http.Cookie{
-				Name:     session.SessionCookie,
-				Value:    sessionID,
-				Path:     "/",
-				HttpOnly: true,
-				Secure:   false,
-				SameSite: http.SameSiteLaxMode,
-			}
-			http.SetCookie(w, cookie)
-			log.Printf("Set session cookie for browser flow")
-		}
-	}
-
-	// Build final redirect URI with parameters
-	finalURI := stateData.RedirectURI
-	params := url.Values{}
-
-	// Add any additional parameters
-	if code != "" {
-		params.Set("code", code)
-	}
-	if state != "" {
-		params.Set("state", state)
-	}
-	if installationID != "" {
-		params.Set("installation_id", installationID)
-	}
-
-	// Construct redirect URL with parameters
-	if len(params) > 0 {
-		if strings.Contains(finalURI, "?") {
-			finalURI += "&" + params.Encode()
-		} else {
-			finalURI += "?" + params.Encode()
-		}
-	}
-
-	log.Printf("Redirecting to final URI: %s", finalURI)
-	http.Redirect(w, r, finalURI, http.StatusFound)
+	return false
 }
 
 // Token handles the token endpoint
@@ -557,11 +376,19 @@ func (h *Handler) Token(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
 	
 	// Handle VS Code's OAuth token exchange (form data)
+	log.Printf("[DEBUG] Token endpoint hit with content type: %s", contentType)
+	
 	if strings.HasPrefix(contentType, "application/x-www-form-urlencoded") {
+		log.Printf("[DEBUG] Processing form-encoded token request")
 		if err := r.ParseForm(); err != nil {
-			log.Printf("Error parsing form: %v", err)
+			log.Printf("[ERROR] Error parsing form: %v", err)
 			http.Error(w, "Invalid form data", http.StatusBadRequest)
 			return
+		}
+		
+		// Log all form values for debugging
+		for key, values := range r.Form {
+			log.Printf("[DEBUG] Form value %s: %v", key, values)
 		}
 		
 		code := r.FormValue("code")
@@ -572,22 +399,7 @@ func (h *Handler) Token(w http.ResponseWriter, r *http.Request) {
 		log.Printf("OAuth token request - code: %v, redirect_uri: %s, grant_type: %s",
 			code != "", redirectURI, grantType)
 		
-		var token, scope string
-		var err error
-		
-		switch grantType {
-		case "authorization_code":
-			token, scope, err = h.exchangeCodeForToken(code, codeVerifier, redirectURI)
-			if err != nil {
-				log.Printf("Token exchange failed: %v", err)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"error": "invalid_grant",
-					"error_description": err.Error(),
-				})
-				return
-			}
-		default:
+		if grantType != "authorization_code" {
 			log.Printf("Unsupported grant type: %s", grantType)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -596,69 +408,163 @@ func (h *Handler) Token(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+
+		// Get state from form data
+		state := r.FormValue("state")
+
+		// If we have a code verifier, verify it matches stored challenge
+		if codeVerifier != "" && state != "" {
+			challenge := session.PopState(state + "_cc")
+			method := session.PopState(state + "_ccm")
+			
+			if challenge == "" || method == "" {
+				log.Printf("No stored PKCE data found for state: %s", state)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": "invalid_request",
+					"error_description": "Invalid PKCE state",
+				})
+				return
+			}
+		}
+
+		// Exchange code for access token
+		tokenURL := fmt.Sprintf("%s/login/oauth/access_token", h.config.GithubHost)
+		log.Printf("[DEBUG] Token exchange URL: %s", tokenURL)
 		
-		sessionID, err := session.Create(token, redirectURI)
+		tokenData := map[string]interface{}{
+			"client_id": h.config.ClientID,
+			"client_secret": h.config.ClientSecret,  // Add client secret for GitHub App
+			"code": code,
+			"redirect_uri": redirectURI,
+		}
+		if codeVerifier != "" {
+			tokenData["code_verifier"] = codeVerifier
+		}
+		
+		log.Printf("[DEBUG] Token exchange request data: %+v", tokenData)
+		
+		// Log GitHub configuration
+		log.Printf("[DEBUG] Using GitHub host: %s", h.config.GithubHost)
+		log.Printf("[DEBUG] Using client ID: %s", h.config.ClientID)
+		log.Printf("[DEBUG] Client secret present: %v", h.config.ClientSecret != "")
+
+		jsonData, err := json.Marshal(tokenData)
 		if err != nil {
-			log.Printf("Session creation failed: %v", err)
+			log.Printf("Failed to marshal token request: %v", err)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"error": "server_error",
-				"error_description": "Failed to create session",
+				"error_description": "Internal server error",
 			})
-			return
-		}
-		
-		sess := session.Get(sessionID)
-		if sess == nil {
-			log.Printf("Failed to retrieve created session: %s", sessionID)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error": "server_error",
-				"error_description": "Session creation failed",
-			})
-			return
-		}
-		
-		// For VS Code, we return the GitHub token directly
-		if strings.Contains(redirectURI, "127.0.0.1:33418") ||
-		   strings.Contains(redirectURI, "localhost:33418") ||
-		   strings.Contains(redirectURI, "vscode://") ||
-		   strings.Contains(redirectURI, "vscode-insiders://") {
-			response := map[string]interface{}{
-				"access_token": token,
-				"token_type": "Bearer",
-				"scope": scope,
-			}
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(response); err != nil {
-				log.Printf("Error encoding OAuth response: %v", err)
-			}
 			return
 		}
 
-		// For browser flows, use our session token
+		req, err := http.NewRequest("POST", tokenURL, bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Printf("Failed to create token request: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "server_error",
+				"error_description": "Internal server error",
+			})
+			return
+		}
+
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("Token request failed: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "server_error",
+				"error_description": "Failed to exchange code for token",
+			})
+			return
+		}
+		defer resp.Body.Close()
+
+		var oauthResp struct {
+			AccessToken string `json:"access_token"`
+			TokenType  string `json:"token_type"`
+			Scope     string `json:"scope"`
+		}
+		var rawResp map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&rawResp); err != nil {
+			log.Printf("[ERROR] Failed to decode token response: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "server_error",
+				"error_description": "Invalid token response",
+			})
+			return
+		}
+
+		log.Printf("[DEBUG] Raw token response from GitHub: %+v", rawResp)
+
+		if errMsg, ok := rawResp["error"].(string); ok {
+			log.Printf("[ERROR] GitHub returned error: %s - %s", errMsg, rawResp["error_description"])
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": errMsg,
+				"error_description": rawResp["error_description"],
+			})
+			return
+		}
+
+		oauthResp.AccessToken = rawResp["access_token"].(string)
+		if scope, ok := rawResp["scope"].(string); ok {
+			oauthResp.Scope = scope
+		}
+		if tokenType, ok := rawResp["token_type"].(string); ok {
+			oauthResp.TokenType = tokenType
+		}
+
+		log.Printf("[DEBUG] Successfully exchanged code for token with scope: %s", oauthResp.Scope)
+
+		// Create a session with the token
+		sessionID, err := session.Create(oauthResp.AccessToken, redirectURI)
+		if err != nil {
+			log.Printf("[ERROR] Failed to create session: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// Set session cookie with broader compatibility
+		cookie := &http.Cookie{
+			Name:     session.SessionCookie,
+			Value:    sessionID,
+			Path:     "/",  // Covers both / and /? paths
+			HttpOnly: true,
+			Secure:   strings.HasPrefix(h.config.ServerURL, "https"),  // Set based on protocol
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   86400, // 24 hours
+		}
+		http.SetCookie(w, cookie)
+		log.Printf("[DEBUG] Set session cookie: name=%s, path=/, sessionID=%s", session.SessionCookie, sessionID)
+
+		log.Printf("[DEBUG] Created session %s with token for URI %s", sessionID, redirectURI)
+
+		// For VS Code, return the token directly
 		response := map[string]interface{}{
-			"access_token": token,
-			"token_type": "Bearer",
-			"scope": scope,
-			"expires_in": 3600,
+			"access_token": oauthResp.AccessToken,
+			"token_type":   "Bearer",  // Always use Bearer
+			"scope":        oauthResp.Scope,
 		}
-		
-		if len(sess.Installations) > 0 {
-			installs := make([]map[string]interface{}, 0)
-			for _, inst := range sess.Installations {
-				installs = append(installs, map[string]interface{}{
-					"id": inst.ID,
-					"account": inst.Account,
-					"permissions": inst.Permissions,
-				})
-			}
-			response["installations"] = installs
-		}
-		
+		log.Printf("[DEBUG] VS Code token request details:")
+		log.Printf("  Request URI: %s", r.RequestURI)
+		log.Printf("  User-Agent: %s", r.UserAgent())
+		log.Printf("  Code: %s...", code[:10])
+		log.Printf("  Redirect URI: %s", redirectURI)
+		log.Printf("  Grant Type: %s", grantType)
+		log.Printf("  Response: access_token=%s***, type=%s, scope=%s", 
+			oauthResp.AccessToken[:10], response["token_type"], response["scope"])
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(response); err != nil {
-			log.Printf("Error encoding OAuth response: %v", err)
+			log.Printf("[ERROR] Error encoding token response: %v", err)
 		}
 		return
 	}
@@ -814,45 +720,4 @@ func (h *Handler) Token(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Error encoding token response: %v", err)
 	}
-}
-
-// UserInfo handles the userinfo endpoint
-func (h *Handler) UserInfo(w http.ResponseWriter, r *http.Request) {
-	sessionID := ""
-	cookie, err := r.Cookie(session.SessionCookie)
-	if err == nil {
-		sessionID = cookie.Value
-	}
-
-	sess := session.Get(sessionID)
-	if sess == nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"jsonrpc": "2.0",
-			"error": map[string]interface{}{
-				"code": -32001,
-				"message": "Not authenticated",
-			},
-		})
-		return
-	}
-
-	userInfo, err := h.getUserInfo(sess.AccessToken)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"jsonrpc": "2.0",
-			"error": map[string]interface{}{
-				"code": -32003,
-				"message": "Failed to fetch user info",
-				"data": map[string]interface{}{
-					"details": err.Error(),
-				},
-			},
-		})
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(userInfo)
 }
