@@ -46,6 +46,31 @@ The MCP HTTP STDIO Proxy is designed to facilitate secure integration between VS
 
 The server will start on `http://localhost:8080` by default.
 
+## Releases
+
+### Automatic Releases
+
+The repository is configured to automatically build and create releases when version tags are pushed:
+
+```bash
+git tag v1.0.2
+git push origin v1.0.2
+```
+
+### Manual Release Creation
+
+For existing tags or to manually trigger a release, you can use GitHub's manual workflow dispatch:
+
+1. Go to the [Actions tab](../../actions/workflows/release.yml) in the repository
+2. Click "Run workflow" 
+3. Enter the tag name (e.g., `v1.0.0` or `v1.0.1`)
+4. Click "Run workflow"
+
+This is useful for:
+- Creating releases for tags that existed before the workflow was added
+- Re-creating releases if needed
+- Testing the release process
+
 ## Configuration
 
 The server uses environment variables for configuration. Copy `.env.sample` to `.env` and configure:
