@@ -16,11 +16,33 @@ The MCP HTTP STDIO Proxy is designed to facilitate secure integration between VS
 
 ### Prerequisites
 
-- Go 1.20 or later
 - GitHub App configured on your GitHub Enterprise Server
 - Access to GitHub Enterprise Server instance
+- Go 1.20 or later (only required for building from source)
 
 ### Installation
+
+#### Option 1: Download Pre-built Binary (Recommended)
+
+1. **Download the latest release:**
+   ```bash
+   curl -L -o mcp-proxy https://github.com/kwacky1/mcp_http_stdio_proxy/releases/latest/download/mcp_proxy_linux
+   chmod +x mcp-proxy
+   ```
+
+2. **Configure environment variables:**
+   ```bash
+   curl -L -o .env.sample https://raw.githubusercontent.com/kwacky1/mcp_http_stdio_proxy/main/.env.sample
+   cp .env.sample .env
+   # Edit .env with your configuration
+   ```
+
+3. **Run the server:**
+   ```bash
+   ./mcp-proxy
+   ```
+
+#### Option 2: Build from Source
 
 1. **Clone the repository:**
    ```bash
